@@ -1,0 +1,682 @@
+---
+title: "Caravan Insurance: Selling Efficiently"
+subtitle: "Where should marketing and sales be focused?"
+author: "Erik Carrion"
+date: "2023-11-20"
+output: pdf_document
+---
+
+```{r setup, include=FALSE, echo = F, message = F, warning = F}
+knitr::opts_chunk$set(echo = F, message = F, warning = F)
+
+# load dependencies
+packs <- c(
+  # plotting, grammar
+  "tidyverse",
+  # parallel computing
+  "doMC","parallel",
+  # modeling tools: roc/auc, elastic-net, RF  
+   "pROC", "glmnet", "randomForest", "caret",
+  # misc utilities
+  "ggpubr", "readr", "scales")
+
+# function to load packages and install as needed
+loadpack <- function(pkg){
+  new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])]
+   if (length(new.pkg))
+     install.packages(new.pkg, dependencies = TRUE)
+   sapply(pkg, require, character.only = TRUE)
+}
+# call the function
+loadpack(packs)
+
+# set wd to file location
+file_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+setwd(file_path)
+
+# load workspace saved after running project script
+load("caravan_workspace.RData")
+
+# read data
+train.data <-
+  read_csv("caravan-insurance-challenge.csv") %>%
+  as.data.frame() %>%
+  mutate(MOSTYPE = ifelse(MOSTYPE == 32, 5, MOSTYPE)) %>%
+  filter(ORIGIN == "train") %>%
+  select(-ORIGIN)
+
+
+```
+
+# Executive Summary
+
+The caravan insurance challenge asked competition entrants to use a training set of 5800 observations in 85-D space to develop a predictive model that provides insight into the factors that positively influence the sale of caravan insurance.
+
+The present analysis considers how 3 linear models and a tree based method perform in an expanded feature space. After one-hot-encoding the original feature space, we go from an 85-D to a 538-D sparse feature space. In this higher dimensional space, Elastic-Net performs the best, yielding a parsimonious model of 58 predictors.
+
+We find that if the company wishes to increase their sales of caravan insurance they should focus their marketing & sales efforts on:
+
+```         
+1. Areas with higher proportions of:
+    - middle class families,
+    - car ownership,
+    - religious diversity, and
+    - religious activity.
+2. Where the company has active:
+    - contribution car policies,
+    - contribution fire policies, and 
+    - boat policies 
+```
+
+They should place special attention to areas where they have active boat policies. If a neighborhood can support the expense of boat ownership, then the expense of caravan ownership, which includes caravan insurance, is within reach.
+
+\newpage
+
+# Introduction
+
+The purpose of this analysis is to compare how elastic-net, ridge, lasso, and random forest compare in a classification setting where the dimensionality of the predictor space is very high and we're working with a moderate amount of data.
+
+To this end we make use of caravan insurance data that was provided as part of the CoIL 2000 Challenge on Kaggle. We start with a description of the data before proceeding with an exploratory analysis to gain a better understanding of the company's customers.
+
+To assess model performance, we employ a 50 run simulation where we train and validate all 4 models using a 90/10 split. At each iteration we record train and test AUC and the time it takes to fit each model.
+
+Once the simulations have completed, we cross validate each model on the entirety of the training data and inspect the resulting model to gain insight into the factors that drive caravan insurance sales.
+
+# Data Description
+
+The dataset used contains information on the customers of an insurance company. It includes demographic data and product usage data at a zip-code level of resolution. Customers can be classified according to 1 of 10 main types each of which can be described by 1 to 5 different customer sub-types allowing for 40 unique customer combinations.
+
+For example, Successful Hedonists are characterized as older, affluent individuals with status while customers categorized as Living Well are characterized as younger individuals enjoying apartment living in a culturally and economically diverse urban area.
+
+```{r sub-types, echo = F, warning = F, message = F}
+sub_types = sort(unique(train.data$MOSTYPE))
+  
+sub_types_list = 
+  list('1' = "High Income, expensive child",
+       '2' = "Very Important Provincials",
+       '3' = "High status seniors",
+       '4' = "Affluent senior apartments",
+       '5' = "Mixed seniors",
+       '6' = "Career and childcare",
+       '7' = "Dinkis",
+       '8' = "Middle class families",
+       '9' = "Modern, complete families",
+       '10' = "Stable family",
+       '11' = "Family starters",
+       '12' = "Affluent young families",
+       '13' = "Young all american family",
+       '14' = "Junior cosmopolitan",
+       '15' = "Senior cosmopolitans",
+       '16' = "Students in apartments",
+       '17' = "Fresh masters in the city",
+       '18' = "Single youth",
+       '19' = "Suburban youth",
+       '20' = "Ethnically diverse",
+       '21' = "Young urban have-nots",
+       '22' = "Mixed apartment dwellers",
+       '23' = "Young and rising",
+       '24' = "Young, low educated",
+       '25' = "Young seniors in the city",
+       '26' = "Own home elderly",
+       '27' = "Seniors in apartments",
+       '28' = "Residential elderly",
+       '29' = "Porchless seniors: no front yard",
+       '30' = "Religious elderly singles",
+       '31' = "Low income catholics",
+       '33' = "Lower class large families",
+       '34' = "Large family, employed child",
+       '35' = "Village families",
+       '36' = "Married with children",
+       '37' = "Mixed small town dwellers",
+       '38' = "Traditional families",
+       '39' = "Large religous families",
+       '40' = "Large family farms",
+       '41' = "Mixed rurals")
+```
+
+Customer data is either ordinal or nominal while demographic & product usage data is all ordinal. Demographic data is recorded as the *percentage* of the given variable observed within the given zip code while product usage data is recorded as the *total* of the given variable observed in the given zip code.
+
+## Customer Characteristics
+
+### Main Types
+
+Customers can be assigned one of ten main customer types:
+
+```         
+1. Successful hedonists
+2. Driven Growers
+3. Average Family
+4. Career Loners
+5. Living well
+6. Cruising Seniors
+7. Retired and Religious
+8. Family with grown ups
+9. Conservative families
+10. Farmers
+```
+
+The data dictionary only provides the labels described above. Without the precise definitions of the main customer types, our inferences will be limited.
+
+We see they are descriptive, specific, and have a touch of linguistic flourish - 'cruising seniors' & 'living well', for example. This stands apart from the mathematical precision we expect from an insurance company's core business, suggesting the labels were developed by a research/marketing team either internally or externally.
+
+The specificity of the labels & the fact the dataset was provided through Kaggle, a website focused on machine learning competitions, suggests they were developed using a data-driven approach. If so, we can infer the labels describe the entire population of the company's customers.
+
+The combination of main-type and sub-type allows us to see how the sub-types are ascribed to the main-types. For each main type there are 2 to 5 associated sub-types and except for sub-type 5,'mixed seniors', every sub-type is associated with a single main-type.
+
+```{r main-type-subs-table, echo = F, warning = F, message = F}
+
+knitr::kable(table(train.data$MOSTYPE, train.data$MOSHOOFD))
+```
+
+We see that 'Career Loners" (main type 4) are the least prevalent of the groups while 'Middle Class Families' (main type 8) are the most prevalent.
+
+```{r main-type-prevalence, echo = F, warning = F, message = F}
+table(train.data$MOSTYPE, train.data$MOSHOOFD) %>%
+  apply(2, sum) %>%
+  sort()
+```
+
+The associated sub-types for each main-type allows us to better understand how the main-types are defined. Of the ten main types, six are family related, two are related to conservative values, and four are related to seniors.
+
+```{r main-type-subs-list, echo = F, message = F, warning = F}
+main_type_subs = list(
+             'Successful Hedonists'  = unlist(sub_types_list[as.character(c(1:5))])     %>% unname(),
+             'Driven Growers'        = unlist(sub_types_list[as.character(c(6:8))])     %>% unname(),
+             'Average Family'        = unlist(sub_types_list[as.character(c(9:13))])    %>% unname(),
+             'Career Loners'         = unlist(sub_types_list[as.character(c(15:19))])   %>% unname(),
+             'Living Well'           = unlist(sub_types_list[as.character(c(20:24))])   %>% unname(),
+             'Cruising Seniors'      = unlist(sub_types_list[as.character(c(25:28))])   %>% unname(),
+             'Retired & Religious'   = unlist(sub_types_list[as.character(c(5,29:31))]) %>% unname(),
+             'Family with Grown Ups' = unlist(sub_types_list[as.character(c(33:37))])   %>% unname(),
+             'Conservative Families' = unlist(sub_types_list[as.character(c(38:39))])   %>% unname(),
+             'Farmers'               = unlist(sub_types_list[as.character(c(40:41))])   %>% unname()
+           ) 
+
+main_type_subs
+
+```
+
+Looking at the distribution of main-types, the top 3 main types make up 53% of observations and are all family related.
+
+```{r main-type-distribution, echo = F, message = F, warning= F}
+
+main_types <- 
+  train.data %>%
+  dplyr::select(MOSHOOFD) %>% 
+  rename(type = MOSHOOFD) %>%
+  mutate(label = factor(case_when(
+    type == 1  ~ "1: Successful hedonists",
+    type == 2  ~ "2: Driven Growers",
+    type == 3  ~ "3: Average Family",
+    type == 4  ~ "4: Career Loners",
+    type == 5  ~ "5: Living well",
+    type == 6  ~ "6: Cruising Seniors",
+    type == 7  ~ "7: Retired and Religious",
+    type == 8  ~ "8: Family with grown ups",
+    type == 9  ~ "9: Conservative families",
+    type == 10 ~ "10: Farmers"),
+    levels = c("8: Family with grown ups","3: Average Family","9: Conservative families",
+               "5: Living well","1: Successful hedonists","7: Retired and Religious",
+               "2: Driven Growers", "10: Farmers", "6: Cruising Seniors", "4: Career Loners")),
+    type = as.ordered(type))
+
+
+main_types %>%
+  ggplot() +
+  geom_bar(aes(x = reorder(type, type, function(x)-length(x)),
+               fill = label)) +
+  labs(title = "Distribution of Main Customer Types", 
+       x = "Customer Type",
+       fill = "Customer Type") +
+  theme_bw()
+
+```
+
+### Sub-Types
+
+The data dictionary list 41 different customer sub-types. After accounting for duplicates and omitted entries, we are left with 39 different customer sub-types. We can view these sub-types as granular descriptions of 3 overarching sub-types defined by their lowest common denominator: seniors, families, and individuals. Of the 40 sub-types, seniors represent 25% of types, while families and individuals each each make up 37.5% of labels.
+
+```{r sub-type-top-10, echo = F, message = F, warning = F}
+
+sub_types <-
+  train.data %>%
+  dplyr::select(MOSTYPE) %>%
+  rename(sub_type = MOSTYPE) %>%
+  group_by(sub_type) %>%
+  summarize(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(prop = count/sum(count),
+         cumprop = cumsum(prop))
+
+top_10_sub_types <-
+  sub_types %>% 
+  slice_max(prop, n = 10)
+
+labels = unname(unlist(sub_types_list[as.character(top_10_sub_types$sub_type)]))
+
+top_10_sub_types <-
+  top_10_sub_types %>%
+  mutate(label = labels) %>%
+  relocate(label, .after = sub_type)
+
+top_10_sub_types[1:10,] %>% print.data.frame()
+```
+
+Continuing the trend we saw with the main customer types, the sub-types are dominated by family related labels. Of the top 10, 7 are family based categories. In combination with the most prevalent main customer types, we can infer that, at least based on the dataset, that their customers are primarily defined by their family affiliation/structure. Their largest customer sub-type is large lower class families which are part of main-type 8, 'Family with grown ups', which also includes `r main_type_subs[[8]]` so we can infer they are unlikely to be affluent. If they aren't defined in relation to a family, they are either on their way to the top ('Young and rising') or already there ('High status seniors').
+
+```{r sub-type-distribution, echo = F, message = F, warning = F}
+train.data %>%
+  rename(sub_type = MOSTYPE) %>%
+  ggplot() +
+  geom_bar(aes(x = reorder(sub_type, sub_type, function(x)-length(x))),
+           fill = "lightblue3", 
+           color = "black",
+           show.legend = F) +
+  labs(title = "Distribution of Customer Sub-Types", 
+       x = "sub-type") +
+  theme_bw()
+```
+
+# Predictors
+
+We have 85 predictors all of which are either nominal or ordinal. The ordinal variables represent percentages or totals and each can take on one of ten values from 0 to 9. Some variables do not make sense in this context. For example, for Average Income, MINKGEM, the most common values are 3 and 4 which correspond to 24-36% and 37-49% respectively. The data dictionary only says these numbers relate to the percentage observed in the given zip code. Without a reference baseline, the statement 'average income is 24-36%' doesn't confer a usable meaning.
+
+Looking at the ordinal predictors only, we can use their overall sums as a starting point for an investigation into their distributions. Variables with larger sums can be expected to have many observations assigned to higher levels and vice-versa. Below are the top 10 variables by sum.
+
+```{r predictor-sums, warning = F, message = F}
+
+ttvs <-
+  train.data[-86] %>% 
+  select(-c("MOSTYPE","MGEMLEEF","MOSHOOFD")) %>%
+  apply(2,sum) %>%
+  sort(decreasing = T) %>%
+  .[1:10]
+
+btvs <-
+  train.data[-86] %>% 
+  select(-c("MOSTYPE","MGEMLEEF","MOSHOOFD")) %>%
+  apply(2,sum) %>%
+  sort() %>%
+  .[1:10]
+
+tbvs <- data.frame(top = names(ttvs), top10 = ttvs,
+                   bottom = names(btvs), bot10 = btvs)
+rownames(tbvs) <- NULL
+tbvs %>% print.data.frame()
+
+
+```
+
+We'll compare the distributions of MZFONDS to MKOOPKLA to see how they relate. MZFONDS represents the percentage of the zip code utilizing public health insurance and MKOOPKLA refers to the purchasing power class the customer belongs to. The former is measured as the "percentage of each group, per postal code" and the latter is measured on a scale of 1 to 8. We see that the majority of customers are assigned to a level of 5 or above for public health utilization and most customers are below a 5 in purchasing power class. Together, it supports our initial inference that most customers are not likely to be affluent.
+
+```{r mzfonds-mkoopkla, echo = F, message = F, warning = F}
+perc_key = c("0%", "1-10%", "11-23%", 
+            "24-36%", "37-49%", "50-62%",
+            "63-75%", "76-88%", "89-99%",
+            "100%")
+mzfonds <- 
+  train.data %>% 
+  mutate(MZFONDS = factor(MZFONDS)) %>%
+  ggplot() + 
+  geom_histogram(aes(MZFONDS),
+                 stat = "count",
+                 fill = "lightblue3",
+                 color = "black",
+                 binwidth = 0.5) +
+  scale_fill_manual(name = "Percentage Key",
+                    breaks = perc_key,
+                    values = cols) +
+  labs(title = "Public Health Insurance Utilization",
+       x = "percentage level") + theme_bw()
+
+mkoopkla <-
+  train.data %>% 
+  mutate(MKOOPKLA = factor(MKOOPKLA)) %>%
+  ggplot() + 
+  geom_histogram(aes(MKOOPKLA),
+                 stat = "count",
+                 fill = "lightblue3",
+                 color = "black",
+                 binwidth = 0.5) +
+  labs(title = "Distribution of Purchasing Power",
+       x = "level") + theme_bw()
+
+ggarrange(mzfonds, mkoopkla, nrow = 2)
+
+
+```
+
+Education is encoded using 3 multinomial indicator variables for low, medium, and high educational attainment. Inspecting the distribution of educational attainment, we observe that attainment is not distributed comparably between the three levels and within the levels we observe differences in the patterns of variation.
+
+```{r education, echo = F, message = F, warning = F}
+low_edu = mid_edu = high_edu = c()
+
+for(i in 0:9){
+   low_edu[i]  = sum(train.data$MOPLLAAG == i)
+   mid_edu[i]  = sum(train.data$MOPLMIDD == i)
+   high_edu[i] = sum(train.data$MOPLHOOG == i)
+  
+}
+
+education = 
+  data.frame(
+    level = c(1:9),
+    percentage = c(perc_key[2:10]),
+    low  = c(low_edu),
+    mid  = c(mid_edu),
+    high = c(high_edu)) %>%
+  mutate(
+    total  = low+mid+high,
+    low.p  = ifelse(low == 0, 0, low/total), 
+    mid.p  = ifelse(mid == 0, 0, mid/total), 
+    high.p = ifelse(high == 0, 0, high/total))
+
+education %>% print.data.frame()
+
+```
+
+```{r education-plots, warning = F, message = F}
+low <- 
+  education %>%
+  mutate(level = factor(level, levels = 1:9),
+         percentage = factor(percentage, 
+                             levels = perc_key[2:10])) %>%
+  ggplot(aes(level, low, fill = percentage)) +
+  geom_col(color ="black") +
+  theme_bw() +
+  labs(fill = "Level Key")
+
+mid <- 
+  education %>%
+  mutate(level = factor(level, levels = 1:9),
+         percentage = factor(percentage, 
+                             levels = perc_key[2:10])) %>%
+  ggplot(aes(level, mid, fill = percentage)) +
+  geom_col(color ="black") +
+  theme_bw() +
+  labs(fill = "Level Key")
+
+high <- 
+  education %>%
+  mutate(level = factor(level, levels = 1:9),
+         percentage = factor(percentage, 
+                             levels = perc_key[2:10])) %>%
+  ggplot(aes(level, high, fill = percentage)) +
+  geom_col(color ="black") +
+  theme_bw() +
+  labs(fill = "Level Key")
+
+plot = ggarrange(low,mid,high, 
+          ncol = 3, 
+          common.legend = T, legend = "right")
+annotate_figure(plot, top = text_grob("Educational Attainment",
+                                      size = 14, face = "bold"))
+
+```
+
+The distribution of customers with low educational attainment shows a somewhat symmetric distribution about level 5. For customers with a mid level of attainment, the distribution is more right skewed than that of low educational attainment, peaking at level 4. High educational attainment is extremely right skewed, peaking at level 1. Overall mid and high educational attainment is predominantly observed in lower percentages while low educational is predominant in the higher percentage levels.
+
+Given that the company's customers tend to have lower educational attainment and occupy lower purchasing power classes, we now look to the distribution of income. The data dictionary defines 4 indicator variables for income with as stratified and indicated by the variables MINKM30, MINK3045, MINK4575, MINK7512, and MINK123M which separates income into 5 levels with breaks at \$30k, \$45k, \$75k, and \$122k per annum. Given what we've gathered so far, what we see in the income distribution is not unexpected: the company is less likely to have customers located in high income zip codes.
+
+```{r income-distribution, message = F, warning = F}
+m30 <- 
+  train.data %>%
+  group_by(MINKM30)%>%
+  summarize(INKM30 = n()) %>%
+  rename(level = MINKM30)
+
+m3045 <- 
+  train.data %>%
+  group_by(MINK3045) %>%
+  summarize(INK3045 = n()) %>%
+  rename(level = MINK3045)
+
+m4575 <-
+  train.data %>%
+  group_by(MINK4575) %>%
+  summarize(INK4575 = n()) %>%
+  rename(level = MINK4575)
+
+m7512 <-
+    train.data %>%
+    group_by(MINK7512) %>%
+    summarize(INK7512 = n()) %>%
+    rename(level = MINK7512)
+
+# all possible levels of m123M not represented
+# and must be manually set
+m123M <-
+  train.data %>%
+    group_by(MINK123M) %>%
+    summarize(INK123M = n()) %>%
+    rename(level = MINK123M)
+
+m123M <-
+  data.frame(level = 0:9,
+             INK123M = c(4900, 763, 96, 36, 24, 1, 0, 1, 0, 1))
+
+customer_income <-
+  m30 %>%
+  left_join(m3045, by = "level") %>%
+  left_join(m4575, by = "level") %>%
+  left_join(m7512, by = "level") %>%
+  left_join(m123M, by = "level")
+
+customer_income %>% print.data.frame()
+  
+```
+
+# Model Discussion
+
+The present analysis compares 4 different models: elastic-net, ridge, lasso, and random forest using AUC as our performance metric of choice.
+
+Ridge, lasso, and elastic-net are all linear penalized/regularized regression models. Lasso and Elastic-Net provide a level of variable selection while ridge maintains all variables in the final model. If there are non-linearities in the original feature space, a linear model will not serve well. To ameliorate this issue, we can work work in higher dimensions.
+
+Since this is a classification problem, we use the binomial for the model family in glmnet. This choice drives our decision to one hot encode the feature matrix. This increases the number of features from 85 to 538. Linear models developed in 538-D space will approximate non-linear relationships, to the extent they exist, in 85-D space reasonably well.
+
+In addition to the linear models, we also employ the random forest algorithm to build a prediction tree in this higher dimensional space. Despite its computational expense, the random forest algorithm is widely used and known for yielding accurate models.
+
+We compare the 4 models using AUC and their respective run times to identify which of the four models is the best among the 4. We do not consider other algorithms which may be better suited to the problem at hand like logistic regression or support vector machines. Our purpose here is to investigate the effectiveness of using linear methods in very high dimensions to model relationships in lower dimensional space.
+
+## Model Validation
+
+To assess model effectiveness, we fit the four models on ninety percent of the data, retaining ten percent for validation. We employ cross-validation on the linear models to determine the optimal amount of regularization to apply to the penalty parameters. Random forest, due to its construction, doesn't require cross validation. We repeat this 50 times and assess performance using aggregate measures.
+
+After we've performed the 50 simulations, we fit a final model on the entire training set before proceeding to assess their performance on the holdout set.
+
+## Model Results
+
+Each of the 50 simulations took an average of `r round(mean(run.times$Time)/60)` minutes per iteration. When we compare the three linear models to the tree-based model, we see that in terms of training time, the three methods which perform a sort of variable selection each took over 1 minute to train each compared to 40 seconds for Ridge which uses all the variables in the final model.
+
+In terms of performance, elastic-net & lasso performed the best, followed by ridge and random forest. Elastic Net just barely beats out lasso while taking a few seconds less to fit.
+
+```{r performance-time, echo = F, message = F, warning = F}
+auc.times.df %>%
+  print.data.frame()
+
+```
+
+When we plot the distribution of AUC over the 50 iterations, we get the box plots below. We see that for the training data, the IQR is significantly tighter than for the test data. In each case, except for random forest, training performance is significantly better on average than on the test data. Finally, all three linear models perform significantly better than the tree based method.
+
+```{r AUC-boxplots, echo = F, warning = F, message = F}
+
+elnet.auc.box <- 
+  long.auc.df %>% 
+  ggplot(aes(x = Sample, y = ElNet)) +
+  geom_boxplot() +
+  labs(title = "Elastic Net AUC Boxplot",
+       y = "AUC") +
+  theme_bw()
+
+lasso.auc.box <- 
+  long.auc.df %>% 
+  ggplot(aes(x = Sample, y = Lasso)) +
+  geom_boxplot() +
+  labs(title = "Lasso AUC Boxplot",
+       y = "AUC") +
+  theme_bw()
+
+ridge.auc.box <- 
+  long.auc.df %>% 
+  ggplot(aes(x = Sample, y = Ridge)) +
+  geom_boxplot() +
+  labs(title = "Ridge AUC Boxplot",
+       y = "AUC") +
+  theme_bw()
+
+rf.auc.box <- 
+  long.auc.df %>% 
+  ggplot(aes(x = Sample, y = RF)) +
+  geom_boxplot() +
+  labs(title = "Random Forest AUC Boxplot",
+       y = "AUC") +
+  theme_bw()
+
+
+ggarrange(elnet.auc.box, lasso.auc.box,
+             ridge.auc.box, rf.auc.box,
+             nrow=2, ncol=2)
+
+```
+
+Elastic-Net has the highest median AUC out of all four models.
+
+## Coefficients
+
+Do the methods that perform variable selection agree with each other? While we expect some variation, if the data sufficiently captures the relationship between the response and the predictors, then we expect to see general agreement among the four methods. To do so visually, we plot the standardized coefficients and then order them according to their importance as determined by random forest.
+
+```{r coefficient-plots, echo = F, warning = F, message = F, fig.width = 10, fig.height = 10}
+elnetPlot <-
+  variable.importance %>% 
+  ggplot(aes(x = Number, y = ElNet)) +
+  geom_col() +
+  labs(title = "Standardized Elastic Net Coefficients", x = "Variable", y = "Coefficient") +
+  theme_bw()+
+  theme(axis.text.x=element_blank())
+
+lassoPlot = variable.importance %>% ggplot(aes(x = Number, y = Lasso)) +
+  geom_col() +
+  labs(title = "Standardized Lasso Coefficients", x = "Variable", y = "Coefficient") +
+  theme_bw()+
+  theme(axis.text.x=element_blank())
+
+ridgePlot = variable.importance %>% ggplot(aes(x = Number, y = Ridge)) +
+  geom_col() +
+  labs(title = "Standardized Ridge Coefficients", x = "Variable", y = "Coefficient") +
+  theme_bw() +
+  theme(axis.text.x=element_blank())
+
+rfPlot = variable.importance %>% ggplot(aes(x = Number, y = MeanDecreaseGini)) +
+  geom_col() +
+  labs(title = "Random Forrest Variable Importance", x = "Variable", y = "Coefficient") +
+  theme_bw() +
+  theme(axis.text.x=element_blank())
+
+
+# arrange the plots in a single image
+ggarrange(elnetPlot, lassoPlot, ridgePlot, rfPlot, nrow=4)
+
+```
+
+Lasso and elastic net perform comparably with respect to variable selection. They roughly choose the same variables while generating very similar coefficient estimates. For ridge and random forest we observe a relation between the ridge coefficient estimates and the variable importance reported by random forest.
+
+Overall, all four methods agree in terms of which variables are most important and each achieves a median AUC of at least 70%, with elastic-net performing the best out of the four.
+
+### Top-5 Variables
+
+All 4 models agree that 'PPERSAUT6' & 'PBRAND4' are significant variables. They correspond to levels in PPERSAUT & PBRAND which relate the number of:
+
+```         
+1. contribution car policies:
+    - all agree that level 6 is the most important
+2. contribution fire policies
+    - all 4 agree that level 4 is significant
+    - 2 out of 4 models also include level 3
+```
+
+Specifically, each model agrees that postal codes with 1000-4999 contribution car policies & 200-499 contribution fire policies are significant for determining who will and who will not purchase caravan insurance.
+
+Overall, car insurance (PPERSAUT) and fire insurance (APERSAUT) are chosen by every model. They are in the top 5 for ridge and random forest and in the top 15 for lasso and elastic net.
+
+Despite being observed in only 31 of the 5,820 observations, all three linear models agree that APLEZIER1, a positive number of boat policies, is a significant variable. Given its relatively low prevalence in the data, special focus should be placed on areas where the company has a positive number of active boat policies.
+
+We note that multiple levels of PBRAND are found to be significant across the four models. Further, we see that the customer main type, 'middle class families', is found in 2 of the 4 coefficient sets. Finally, random forest places higher significance on third party insurance products.
+
+```{r largest-5-vars, warning = F, message = F}
+# assemble df
+top_5_vars <-
+  data.frame(number = 1:5,
+             elnet = names(sort(elnet.coefs, decreasing =T)[1:5]),
+             lasso = names(sort(lasso.coefs, decreasing = T)[1:5]),
+             ridge = names(sort(ridge.coefs, decreasing = T)[1:5]),
+             random_forest = 
+               importance(rf.full.model) %>% 
+               as.data.frame() %>% 
+               arrange(desc(MeanDecreaseGini)) %>% 
+               head(n=5) %>% rownames())
+# remove row names
+rownames(top_5_vars) <- NULL
+# print
+top_5_vars %>%
+  print.data.frame()
+```
+
+### Bottom-5 Variables
+
+At the bottom end we see that MINKGEM, PBRAND, MAUTO, and MGODOV are all at the bottom 5 for elastic net, ridge, and lasso. For random forest we first require a positive mean decrease in gini before inspecting the bottom 5 variables, resulting in some disagreement with the linear models.
+
+```{r smallest-5-vars, warning = F, message = F}
+# assemble df
+bot_5_vars <-
+  data.frame(number = 1:5,
+             elnet = names(sort(elnet.coefs)[1:5]),
+             lasso = names(sort(lasso.coefs)[1:5]),
+             ridge = names(sort(ridge.coefs)[1:5]),
+             random_forest = 
+               importance(rf.full.model) %>% 
+               as.data.frame() %>% 
+               filter(MeanDecreaseGini>0) %>% 
+               arrange(MeanDecreaseGini) %>% 
+               head(n=5) %>% 
+               rownames())
+# remove row names
+rownames(bot_5_vars) <- NULL
+# print
+bot_5_vars %>%
+  print.data.frame()
+```
+
+Overall, if we observe the following conditions we can expect a lower likelihood of caravan insurance being purchased:
+
+```         
+- moderately low (level 4) or high (level 8) levels of *no* car ownership 
+- low numbers (level 2) of fire policies
+- low levels of 'other' religious affiliations
+- high levels of 'no' religious affiliations
+- whether a customer is a farmer
+- whether average income falls in to the 24-36% bucket
+```
+
+# Conclusion
+
+The models suggest that focusing marketing and sales efforts in postal codes that meet the following criteria will maximize the likelihood of selling caravan insurance:
+
+```         
+1. Has 1000-4999 active contribution car policies,
+2. Has 200-499 active contribution fire policies,
+3. Has 1-49 active boat policies
+4. Higher proportions of middle class families
+5. Higher rates of religious activity
+6. Higher rates of religious diversity
+6. Higher rates of car ownership 
+```
+
+Of the four models tested, elastic-net performed the best, using a mix of the L2 and L1 penalty and, like lasso, yields a parsimonious model with only 58 predictors. Run time was not a significant consideration in this scenario. Given its overall performance and parsimony, we recommend elastic-net over the other three models.
+
+Special focus should be placed on areas where the company has greater than 0 active boat policies. Boat ownership implies an area with excess disposable income. If they can afford the expense of a boat and a family, a caravan is within reach and thus, so is caravan insurance.
+
+\newpage
+# References
+
+1. P. van der Putten and M. van Someren (eds) . CoIL Challenge 2000: The Insurance Company Case. Published by Sentient Machine Research, Amsterdam. Also a Leiden Institute of Advanced Computer Science Technical Report 2000-09. June 22, 2000.
+2. Data: https://www.kaggle.com/datasets/uciml/caravan-insurance-challenge?rvi=1
