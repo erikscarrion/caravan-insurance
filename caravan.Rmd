@@ -679,4 +679,4 @@ Special focus should be placed on areas where the company has greater than 0 act
 # References
 
 1. P. van der Putten and M. van Someren (eds) . CoIL Challenge 2000: The Insurance Company Case. Published by Sentient Machine Research, Amsterdam. Also a Leiden Institute of Advanced Computer Science Technical Report 2000-09. June 22, 2000.
-2. Data: https://www.kaggle.com/datasets/uciml/caravan-insurance-challenge?rvi=1
+2. Data: https://github.com/erikscarrion/caravan-insurance/blob/edx_ds_cert/caravan-insurance-challenge.csv
